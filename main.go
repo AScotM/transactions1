@@ -27,10 +27,10 @@ type Payment struct {
 }
 
 type PaymentGateway struct {
-	Name       string        `json:"name"`
-	SuccessRate float64      `json:"success_rate"`
-	Latency    time.Duration `json:"latency"`
-	IsActive   bool          `json:"is_active"`
+	Name        string        `json:"name"`
+	SuccessRate float64       `json:"success_rate"`
+	Latency     time.Duration `json:"latency"`
+	IsActive    bool          `json:"is_active"`
 }
 
 type FraudDetectionResult struct {
@@ -104,7 +104,10 @@ func (p *PaymentProcessor) ProcessPayment(amount float64, currency, merchantID, 
 	}
 
 	if fraudResult.IsFraudulent {
+		// Protect metrics increment with lock
+		p.mu.Lock()
 		p.metrics.FraudDetected++
+		p.mu.Unlock()
 		return p.handlePaymentFailure(payment, "fraud_detected", startTime)
 	}
 
@@ -115,15 +118,19 @@ func (p *PaymentProcessor) ProcessPayment(amount float64, currency, merchantID, 
 
 	// Step 3: Process with selected gateway
 	gateway := p.selectPaymentGateway()
+	p.mu.Lock()
 	payment.Status = "processing"
+	p.mu.Unlock()
 
 	// Simulate gateway processing with potential failure
 	success := p.processWithGateway(payment, gateway)
 	if !success {
 		// Retry logic
 		if payment.RetryCount < 2 {
+			p.mu.Lock()
 			payment.RetryCount++
 			fmt.Printf("Retrying payment %s (attempt %d)\n", payment.ID, payment.RetryCount)
+			p.mu.Unlock()
 			success = p.processWithGateway(payment, gateway)
 		}
 	}
@@ -146,7 +153,7 @@ func (p *PaymentProcessor) processWithGateway(payment *Payment, gateway PaymentG
 }
 
 func (p *PaymentProcessor) selectPaymentGateway() PaymentGateway {
-	// Simple round-robin selection - in reality, this would be more sophisticated
+	// Simple selection of active gateways
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -168,23 +175,28 @@ func (p *PaymentProcessor) selectPaymentGateway() PaymentGateway {
 func (p *PaymentProcessor) handlePaymentSuccess(payment *Payment, gateway string, startTime time.Time) (*Payment, error) {
 	processingTime := time.Since(startTime)
 
+	// Update payment fields and metrics under lock to avoid races with readers
+	p.mu.Lock()
 	payment.Status = "completed"
 	payment.ProcessedAt = time.Now()
 
-	p.mu.Lock()
 	p.metrics.Successful++
 	p.metrics.TotalProcessed++
 	p.metrics.TotalAmount += payment.Amount
-	
+
 	// Update average processing time
 	if p.metrics.Successful == 1 {
 		p.metrics.AverageProcessingTime = processingTime
 	} else {
 		p.metrics.AverageProcessingTime = time.Duration(
-			(float64(p.metrics.AverageProcessingTime)*float64(p.metrics.Successful-1) + float64(processingTime)) / float64(p.metrics.Successful),
+			(float64(p.metrics.AverageProcessingTime)*float64(p.metrics.Successful-1)+float64(processingTime))/float64(p.metrics.Successful),
 		)
 	}
-	p.metrics.SuccessRate = float64(p.metrics.Successful) / float64(p.metrics.TotalProcessed)
+	if p.metrics.TotalProcessed > 0 {
+		p.metrics.SuccessRate = float64(p.metrics.Successful) / float64(p.metrics.TotalProcessed)
+	} else {
+		p.metrics.SuccessRate = 0
+	}
 	p.mu.Unlock()
 
 	fmt.Printf("Payment %s completed successfully via %s (took %v)\n",
@@ -194,14 +206,19 @@ func (p *PaymentProcessor) handlePaymentSuccess(payment *Payment, gateway string
 }
 
 func (p *PaymentProcessor) handlePaymentFailure(payment *Payment, reason string, startTime time.Time) (*Payment, error) {
+	// Update payment fields and metrics under lock to avoid races with readers
+	p.mu.Lock()
 	payment.Status = "failed"
 	payment.ErrorReason = reason
 	payment.ProcessedAt = time.Now()
 
-	p.mu.Lock()
 	p.metrics.Failed++
 	p.metrics.TotalProcessed++
-	p.metrics.SuccessRate = float64(p.metrics.Successful) / float64(p.metrics.TotalProcessed)
+	if p.metrics.TotalProcessed > 0 {
+		p.metrics.SuccessRate = float64(p.metrics.Successful) / float64(p.metrics.TotalProcessed)
+	} else {
+		p.metrics.SuccessRate = 0
+	}
 	p.mu.Unlock()
 
 	fmt.Printf("Payment %s failed: %s\n", payment.ID, reason)
@@ -254,6 +271,7 @@ func (f *FraudDetectionService) CheckPayment(payment *Payment) (*FraudDetectionR
 
 // ChaosInjector for payment-specific failures
 type ChaosInjector struct {
+	mu             sync.RWMutex
 	failureRate    float64
 	latencyRange   time.Duration
 	gatewayOutages map[string]bool
@@ -276,7 +294,9 @@ func (c *ChaosInjector) InjectPaymentChaos(payment *Payment) error {
 		} else {
 			gateway = "PayPal"
 		}
+		c.mu.Lock()
 		c.gatewayOutages[gateway] = true
+		c.mu.Unlock()
 		fmt.Printf("Simulating gateway outage: %s\n", gateway)
 	}
 
@@ -298,8 +318,14 @@ func (c *ChaosInjector) InjectPaymentChaos(payment *Payment) error {
 func (c *ChaosInjector) GetSuccessRateModifier() float64 {
 	// Reduce success rate based on chaos conditions
 	modifier := 1.0
-	if len(c.gatewayOutages) > 0 {
-		modifier -= 0.1 * float64(len(c.gatewayOutages))
+	c.mu.RLock()
+	outages := len(c.gatewayOutages)
+	c.mu.RUnlock()
+	if outages > 0 {
+		modifier -= 0.1 * float64(outages)
+	}
+	if modifier < 0 {
+		modifier = 0
 	}
 	return modifier
 }
@@ -317,7 +343,7 @@ func (p *PaymentProcessor) GenerateBusinessReport() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"metrics":            p.metrics,
+		"metrics":             p.metrics,
 		"revenue_by_merchant": revenueByMerchant,
 		"total_transactions":  len(p.transactionHistory),
 		"timestamp":           time.Now().Format(time.RFC3339),
@@ -340,7 +366,8 @@ func (p *PaymentProcessor) SaveReportToFile(filename string) error {
 
 // Utility functions
 func generatePaymentID() string {
-	return fmt.Sprintf("pay_%d_%d", time.Now().Unix(), secureRandIntn(10000))
+	// Use nanoseconds to reduce collisions when creating many payments quickly.
+	return fmt.Sprintf("pay_%d_%d", time.Now().UnixNano(), secureRandIntn(10000))
 }
 
 func secureRandIntn(n int) int {
@@ -348,21 +375,22 @@ func secureRandIntn(n int) int {
 		return 0
 	}
 	num, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
-	if err != nil {
-		var fallback int64
-		binary.Read(rand.Reader, binary.BigEndian, &fallback)
-		if fallback < 0 {
-			fallback = -fallback
-		}
-		return int(fallback % int64(n))
+	if err == nil {
+		return int(num.Int64())
 	}
-	return int(num.Int64())
+	// fallback: deterministic but acceptable for non-cryptographic uses
+	return int(time.Now().UnixNano() % int64(n))
 }
 
 func secureRandFloat64() float64 {
 	var buf [8]byte
-	rand.Read(buf[:])
-	return float64(binary.LittleEndian.Uint64(buf[:])&((1<<53)-1)) / (1 << 53)
+	if _, err := rand.Read(buf[:]); err != nil {
+		// fallback: use current time as pseudo-randomness
+		return float64(time.Now().UnixNano()&(1<<53-1)) / float64(1<<53)
+	}
+	// Use 53 bits of randomness as in math/rand.Float64
+	u := binary.LittleEndian.Uint64(buf[:]) & ((uint64(1) << 53) - 1)
+	return float64(u) / float64(uint64(1)<<53)
 }
 
 // Demo execution
