@@ -12,18 +12,16 @@ import (
 	"time"
 )
 
-// Configuration management
 type Config struct {
-	BaseFailureRate    float64       `json:"base_failure_rate"`
-	MaxRetries         int           `json:"max_retries"`
-	GatewayTimeout     time.Duration `json:"gateway_timeout"`
-	FraudThreshold     float64       `json:"fraud_threshold"`
-	CircuitBreakerFailures int       `json:"circuit_breaker_failures"`
+	BaseFailureRate        float64       `json:"base_failure_rate"`
+	MaxRetries             int           `json:"max_retries"`
+	GatewayTimeout         time.Duration `json:"gateway_timeout"`
+	FraudThreshold         float64       `json:"fraud_threshold"`
+	CircuitBreakerFailures int           `json:"circuit_breaker_failures"`
 	CircuitBreakerReset    time.Duration `json:"circuit_breaker_reset"`
 }
 
 func LoadConfig() *Config {
-	// In real implementation, load from file/env with validation
 	return &Config{
 		BaseFailureRate:      0.05,
 		MaxRetries:          2,
@@ -34,7 +32,6 @@ func LoadConfig() *Config {
 	}
 }
 
-// Enhanced error handling
 type PaymentError struct {
 	Code      string    `json:"code"`
 	Message   string    `json:"message"`
@@ -47,7 +44,6 @@ func (e *PaymentError) Error() string {
 	return fmt.Sprintf("[%s] %s (payment: %s)", e.Code, e.Message, e.PaymentID)
 }
 
-// Pre-defined error types
 var (
 	ErrFraudDetected   = &PaymentError{Code: "FRAUD", Message: "Transaction flagged as fraudulent", Retryable: false}
 	ErrGatewayTimeout  = &PaymentError{Code: "GATEWAY_TIMEOUT", Message: "Payment gateway timeout", Retryable: true}
@@ -56,19 +52,19 @@ var (
 	ErrCircuitOpen     = &PaymentError{Code: "CIRCUIT_OPEN", Message: "Circuit breaker is open", Retryable: true}
 )
 
-// Business domain models
 type Payment struct {
-	ID           string    `json:"id"`
-	Amount       float64   `json:"amount"`
-	Currency     string    `json:"currency"`
-	MerchantID   string    `json:"merchant_id"`
-	CustomerID   string    `json:"customer_id"`
-	Status       string    `json:"status"` // pending, processing, completed, failed
-	CreatedAt    time.Time `json:"created_at"`
-	ProcessedAt  time.Time `json:"processed_at"`
-	ErrorReason  string    `json:"error_reason,omitempty"`
-	RetryCount   int       `json:"retry_count"`
-	IdempotencyKey string  `json:"idempotency_key,omitempty"`
+	ID             string    `json:"id"`
+	Amount         float64   `json:"amount"`
+	Currency       string    `json:"currency"`
+	MerchantID     string    `json:"merchant_id"`
+	CustomerID     string    `json:"customer_id"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+	ProcessedAt    time.Time `json:"processed_at"`
+	ErrorReason    string    `json:"error_reason,omitempty"`
+	RetryCount     int       `json:"retry_count"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
+	GatewayUsed    string    `json:"gateway_used,omitempty"`
 }
 
 func (p *Payment) Validate() error {
@@ -105,7 +101,6 @@ type FraudDetectionResult struct {
 	Reasons      []string `json:"reasons"`
 }
 
-// Circuit Breaker pattern
 type CircuitBreaker struct {
 	failures     int
 	maxFailures  int
@@ -127,7 +122,6 @@ func (cb *CircuitBreaker) Allow() bool {
 	
 	if cb.failures >= cb.maxFailures {
 		if time.Since(cb.lastFailure) > cb.resetTimeout {
-			// Auto-reset after timeout
 			cb.mu.RUnlock()
 			cb.mu.Lock()
 			cb.failures = 0
@@ -166,7 +160,6 @@ func (cb *CircuitBreaker) State() string {
 	return "closed"
 }
 
-// Core business service
 type PaymentProcessor struct {
 	config             *Config
 	gateways           []PaymentGateway
@@ -177,17 +170,25 @@ type PaymentProcessor struct {
 	idempotencyStore   map[string]*Payment
 	mu                 sync.RWMutex
 	metrics            *PaymentMetrics
+	gatewayStats       map[string]*GatewayStats
+}
+
+type GatewayStats struct {
+	Attempts   int `json:"attempts"`
+	Successes  int `json:"successes"`
+	Failures   int `json:"failures"`
+	Timeouts   int `json:"timeouts"`
 }
 
 type PaymentMetrics struct {
-	TotalProcessed        int           `json:"total_processed"`
-	Successful            int           `json:"successful"`
-	Failed                int           `json:"failed"`
-	FraudDetected         int           `json:"fraud_detected"`
+	TotalProcessed        int64         `json:"total_processed"`
+	Successful            int64         `json:"successful"`
+	Failed                int64         `json:"failed"`
+	FraudDetected         int64         `json:"fraud_detected"`
 	TotalAmount           float64       `json:"total_amount"`
 	AverageProcessingTime time.Duration `json:"average_processing_time"`
 	SuccessRate           float64       `json:"success_rate"`
-	CircuitBreakerTrips   int           `json:"circuit_breaker_trips"`
+	CircuitBreakerTrips   int64         `json:"circuit_breaker_trips"`
 }
 
 func NewPaymentProcessor(config *Config) *PaymentProcessor {
@@ -211,25 +212,24 @@ func NewPaymentProcessor(config *Config) *PaymentProcessor {
 		transactionHistory: make(map[string]*Payment),
 		idempotencyStore:   make(map[string]*Payment),
 		metrics:            &PaymentMetrics{},
+		gatewayStats:       make(map[string]*GatewayStats),
 	}
 
-	// Initialize circuit breakers for each gateway
 	for _, gateway := range gateways {
 		processor.circuitBreakers[gateway.Name] = NewCircuitBreaker(
 			config.CircuitBreakerFailures,
 			config.CircuitBreakerReset,
 		)
+		processor.gatewayStats[gateway.Name] = &GatewayStats{}
 	}
 
 	return processor
 }
 
-// ProcessPayment handles the complete payment flow with chaos injection
 func (p *PaymentProcessor) ProcessPayment(amount float64, currency, merchantID, customerID string) (*Payment, error) {
 	return p.ProcessPaymentWithContext(context.Background(), amount, currency, merchantID, customerID, "")
 }
 
-// ProcessPaymentWithContext handles payment with context support for timeouts
 func (p *PaymentProcessor) ProcessPaymentWithContext(
 	ctx context.Context,
 	amount float64, 
@@ -237,7 +237,6 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 	idempotencyKey string,
 ) (*Payment, error) {
 	
-	// Check idempotency first
 	if idempotencyKey != "" {
 		if existing, found := p.getIdempotentPayment(idempotencyKey); found {
 			return existing, nil
@@ -257,7 +256,6 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 		IdempotencyKey: idempotencyKey,
 	}
 
-	// Validate payment
 	if err := payment.Validate(); err != nil {
 		return p.handlePaymentFailure(payment, err, startTime)
 	}
@@ -272,7 +270,6 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 	fmt.Printf("Processing payment %s: $%.2f from %s to %s\n",
 		payment.ID, amount, customerID, merchantID)
 
-	// Step 1: Fraud detection
 	fraudResult, err := p.fraudService.CheckPayment(payment)
 	if err != nil {
 		return p.handlePaymentFailure(payment, err, startTime)
@@ -292,15 +289,12 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 		return p.handlePaymentFailure(payment, fraudErr, startTime)
 	}
 
-	// Step 2: Inject chaos (simulate real-world failures)
 	if err := p.chaosInjector.InjectPaymentChaos(payment); err != nil {
 		fmt.Printf("Chaos injection affected payment %s: %v\n", payment.ID, err)
 	}
 
-	// Step 3: Process with selected gateway
 	gateway := p.selectPaymentGateway()
 	
-	// Check circuit breaker for selected gateway
 	circuitBreaker := p.circuitBreakers[gateway.Name]
 	if !circuitBreaker.Allow() {
 		circuitErr := &PaymentError{
@@ -317,9 +311,9 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 	payment.Status = "processing"
 	p.mu.Unlock()
 
-	// Process with gateway (with context support)
 	success, processErr := p.processWithGateway(ctx, payment, gateway)
 	if processErr != nil {
+		p.recordGatewayStat(gateway.Name, false, processErr)
 		circuitBreaker.RecordFailure()
 		p.mu.Lock()
 		p.metrics.CircuitBreakerTrips++
@@ -328,7 +322,6 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 	}
 
 	if !success {
-		// Retry logic with circuit breaker awareness
 		if payment.RetryCount < p.config.MaxRetries {
 			p.mu.Lock()
 			payment.RetryCount++
@@ -340,9 +333,12 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 	}
 
 	if success {
+		p.recordGatewayStat(gateway.Name, true, nil)
 		circuitBreaker.RecordSuccess()
+		payment.GatewayUsed = gateway.Name
 		return p.handlePaymentSuccess(payment, gateway.Name, startTime)
 	} else {
+		p.recordGatewayStat(gateway.Name, false, nil)
 		circuitBreaker.RecordFailure()
 		p.mu.Lock()
 		p.metrics.CircuitBreakerTrips++
@@ -359,42 +355,69 @@ func (p *PaymentProcessor) ProcessPaymentWithContext(
 }
 
 func (p *PaymentProcessor) processWithGateway(ctx context.Context, payment *Payment, gateway PaymentGateway) (bool, error) {
-	// Check context cancellation
 	select {
 	case <-ctx.Done():
 		return false, ctx.Err()
 	default:
 	}
 
-	// Simulate gateway latency with context timeout
 	processingTime := gateway.Latency + time.Duration(secureRandIntn(100))*time.Millisecond
 	
-	// Use context with timeout for gateway processing
 	gatewayCtx, cancel := context.WithTimeout(ctx, p.config.GatewayTimeout)
 	defer cancel()
 
-	// Simulate processing with potential cancellation
-	done := make(chan bool, 1)
+	resultChan := make(chan struct {
+		success bool
+		err     error
+	}, 1)
+
 	go func() {
 		time.Sleep(processingTime)
 		
-		// Determine success based on gateway success rate and chaos
 		successThreshold := gateway.SuccessRate * p.chaosInjector.GetSuccessRateModifier()
 		success := secureRandFloat64() <= successThreshold
-		done <- success
+		
+		select {
+		case resultChan <- struct {
+			success bool
+			err     error
+		}{success: success, err: nil}:
+		case <-gatewayCtx.Done():
+		}
 	}()
 
 	select {
 	case <-gatewayCtx.Done():
 		return false, gatewayCtx.Err()
-	case success := <-done:
-		return success, nil
+	case result := <-resultChan:
+		return result.success, result.err
+	}
+}
+
+func (p *PaymentProcessor) recordGatewayStat(gateway string, success bool, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	stats := p.gatewayStats[gateway]
+	if stats == nil {
+		stats = &GatewayStats{}
+		p.gatewayStats[gateway] = stats
+	}
+	
+	stats.Attempts++
+	if success {
+		stats.Successes++
+	} else {
+		stats.Failures++
+		if err == context.DeadlineExceeded {
+			stats.Timeouts++
+		}
 	}
 }
 
 func (p *PaymentProcessor) selectPaymentGateway() PaymentGateway {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 
 	activeGateways := make([]PaymentGateway, 0)
 	for _, gw := range p.gateways {
@@ -404,7 +427,6 @@ func (p *PaymentProcessor) selectPaymentGateway() PaymentGateway {
 	}
 
 	if len(activeGateways) == 0 {
-		// Fallback to first gateway if none active (bypass circuit breaker in emergency)
 		return p.gateways[0]
 	}
 
@@ -424,7 +446,6 @@ func (p *PaymentProcessor) handlePaymentSuccess(payment *Payment, gateway string
 	p.metrics.TotalProcessed++
 	p.metrics.TotalAmount += payment.Amount
 
-	// Update average processing time
 	if p.metrics.Successful == 1 {
 		p.metrics.AverageProcessingTime = processingTime
 	} else {
@@ -435,8 +456,6 @@ func (p *PaymentProcessor) handlePaymentSuccess(payment *Payment, gateway string
 	
 	if p.metrics.TotalProcessed > 0 {
 		p.metrics.SuccessRate = float64(p.metrics.Successful) / float64(p.metrics.TotalProcessed)
-	} else {
-		p.metrics.SuccessRate = 0
 	}
 
 	fmt.Printf("Payment %s completed successfully via %s (took %v)\n",
@@ -457,8 +476,6 @@ func (p *PaymentProcessor) handlePaymentFailure(payment *Payment, err error, sta
 	p.metrics.TotalProcessed++
 	if p.metrics.TotalProcessed > 0 {
 		p.metrics.SuccessRate = float64(p.metrics.Successful) / float64(p.metrics.TotalProcessed)
-	} else {
-		p.metrics.SuccessRate = 0
 	}
 
 	fmt.Printf("Payment %s failed: %v\n", payment.ID, err)
@@ -466,7 +483,6 @@ func (p *PaymentProcessor) handlePaymentFailure(payment *Payment, err error, sta
 	return payment, err
 }
 
-// Idempotency support
 func (p *PaymentProcessor) getIdempotentPayment(key string) (*Payment, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -477,10 +493,23 @@ func (p *PaymentProcessor) getIdempotentPayment(key string) (*Payment, bool) {
 	return nil, false
 }
 
-// FraudDetectionService simulates fraud detection logic
+func (p *PaymentProcessor) CleanupOldData(maxAge time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	cutoff := time.Now().Add(-maxAge)
+	
+	for key, payment := range p.idempotencyStore {
+		if payment.CreatedAt.Before(cutoff) {
+			delete(p.idempotencyStore, key)
+		}
+	}
+}
+
 type FraudDetectionService struct {
 	config       *Config
 	riskPatterns []string
+	mu           sync.RWMutex
 }
 
 func NewFraudDetectionService(config *Config) *FraudDetectionService {
@@ -497,22 +526,21 @@ func NewFraudDetectionService(config *Config) *FraudDetectionService {
 }
 
 func (f *FraudDetectionService) CheckPayment(payment *Payment) (*FraudDetectionResult, error) {
-	// Simulate fraud detection processing
 	time.Sleep(50 * time.Millisecond)
 
 	result := &FraudDetectionResult{
 		RiskScore: secureRandFloat64(),
 	}
 
-	// High amount transactions have higher risk
 	if payment.Amount > 1000 {
 		result.RiskScore += 0.3
 		result.Reasons = append(result.Reasons, "high_amount")
 	}
 
-	// Random risk patterns
 	if secureRandFloat64() < 0.1 {
+		f.mu.RLock()
 		pattern := f.riskPatterns[secureRandIntn(len(f.riskPatterns))]
+		f.mu.RUnlock()
 		result.Reasons = append(result.Reasons, pattern)
 		result.RiskScore += 0.4
 	}
@@ -522,13 +550,12 @@ func (f *FraudDetectionService) CheckPayment(payment *Payment) (*FraudDetectionR
 	return result, nil
 }
 
-// ChaosInjector for payment-specific failures
 type ChaosInjector struct {
 	config         *Config
 	mu             sync.RWMutex
 	failureRate    float64
 	latencyRange   time.Duration
-	gatewayOutages map[string]bool
+	gatewayOutages map[string]time.Time
 }
 
 func NewChaosInjector(config *Config) *ChaosInjector {
@@ -536,34 +563,40 @@ func NewChaosInjector(config *Config) *ChaosInjector {
 		config:         config,
 		failureRate:    config.BaseFailureRate,
 		latencyRange:   2 * time.Second,
-		gatewayOutages: make(map[string]bool),
+		gatewayOutages: make(map[string]time.Time),
 	}
 }
 
 func (c *ChaosInjector) InjectPaymentChaos(payment *Payment) error {
-	// Random gateway outages
-	if secureRandFloat64() < 0.02 { // 2% chance of gateway outage
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	now := time.Now()
+	
+	for gateway, outageEnd := range c.gatewayOutages {
+		if now.After(outageEnd) {
+			delete(c.gatewayOutages, gateway)
+		}
+	}
+
+	if secureRandFloat64() < 0.02 {
 		gateway := "unknown"
 		if secureRandFloat64() < 0.5 {
 			gateway = "Stripe"
 		} else {
 			gateway = "PayPal"
 		}
-		c.mu.Lock()
-		c.gatewayOutages[gateway] = true
-		c.mu.Unlock()
+		c.gatewayOutages[gateway] = now.Add(30 * time.Second)
 		fmt.Printf("Simulating gateway outage: %s\n", gateway)
 	}
 
-	// Random latency spikes
-	if secureRandFloat64() < 0.03 { // 3% chance of high latency
+	if secureRandFloat64() < 0.03 {
 		latency := time.Duration(secureRandIntn(int(c.latencyRange)))
 		time.Sleep(latency)
 		fmt.Printf("Injected latency: %v\n", latency)
 	}
 
-	// Simulate network timeouts
-	if secureRandFloat64() < 0.01 { // 1% chance of timeout
+	if secureRandFloat64() < 0.01 {
 		return ErrGatewayTimeout
 	}
 
@@ -571,11 +604,11 @@ func (c *ChaosInjector) InjectPaymentChaos(payment *Payment) error {
 }
 
 func (c *ChaosInjector) GetSuccessRateModifier() float64 {
-	// Reduce success rate based on chaos conditions
-	modifier := 1.0
 	c.mu.RLock()
+	defer c.mu.RUnlock()
+	
+	modifier := 1.0
 	outages := len(c.gatewayOutages)
-	c.mu.RUnlock()
 	if outages > 0 {
 		modifier -= 0.1 * float64(outages)
 	}
@@ -585,13 +618,12 @@ func (c *ChaosInjector) GetSuccessRateModifier() float64 {
 	return modifier
 }
 
-// Business analytics and reporting
 func (p *PaymentProcessor) GenerateBusinessReport() map[string]interface{} {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	revenueByMerchant := make(map[string]float64)
-	gatewayStats := make(map[string]int)
+	gatewayStats := make(map[string]interface{})
 	
 	for _, payment := range p.transactionHistory {
 		if payment.Status == "completed" {
@@ -599,19 +631,30 @@ func (p *PaymentProcessor) GenerateBusinessReport() map[string]interface{} {
 		}
 	}
 
-	// Circuit breaker states
+	for gateway, stats := range p.gatewayStats {
+		if stats != nil && stats.Attempts > 0 {
+			gatewayStats[gateway] = map[string]interface{}{
+				"attempts":  stats.Attempts,
+				"successes": stats.Successes,
+				"failures":  stats.Failures,
+				"timeouts":  stats.Timeouts,
+				"success_rate": float64(stats.Successes) / float64(stats.Attempts) * 100,
+			}
+		}
+	}
+
 	circuitStates := make(map[string]string)
 	for gateway, cb := range p.circuitBreakers {
 		circuitStates[gateway] = cb.State()
 	}
 
 	return map[string]interface{}{
-		"metrics":             p.metrics,
-		"revenue_by_merchant": revenueByMerchant,
-		"gateway_stats":       gatewayStats,
+		"metrics":               p.metrics,
+		"revenue_by_merchant":   revenueByMerchant,
+		"gateway_stats":         gatewayStats,
 		"circuit_breaker_states": circuitStates,
-		"total_transactions":  len(p.transactionHistory),
-		"timestamp":           time.Now().Format(time.RFC3339),
+		"total_transactions":    len(p.transactionHistory),
+		"timestamp":             time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -629,7 +672,6 @@ func (p *PaymentProcessor) SaveReportToFile(filename string) error {
 	return encoder.Encode(report)
 }
 
-// Utility functions
 func generatePaymentID() string {
 	return fmt.Sprintf("pay_%d_%d", time.Now().UnixNano(), secureRandIntn(10000))
 }
@@ -654,7 +696,6 @@ func secureRandFloat64() float64 {
 	return float64(u) / float64(uint64(1)<<53)
 }
 
-// Demo execution
 func main() {
 	fmt.Println("Enhanced Payment Processing System with Chaos Engineering")
 	fmt.Println("=======================================================")
@@ -662,13 +703,11 @@ func main() {
 	config := LoadConfig()
 	processor := NewPaymentProcessor(config)
 
-	// Simulate business transactions
 	merchants := []string{"amazon", "netflix", "spotify", "uber", "starbucks"}
 	customers := []string{"cust_001", "cust_002", "cust_003", "cust_004", "cust_005"}
 
 	fmt.Println("\nProcessing payments...")
 
-	// Process multiple payments with context and idempotency
 	var wg sync.WaitGroup
 	for i := 0; i < 25; i++ {
 		wg.Add(1)
@@ -691,20 +730,21 @@ func main() {
 					transactionNum, payment.ID, payment.Amount)
 			}
 
-			// Small delay between transactions
 			time.Sleep(100 * time.Millisecond)
 		}(i)
 	}
 
 	wg.Wait()
 
-	// Generate business report
+	processor.CleanupOldData(1 * time.Hour)
+
 	fmt.Println("\nEnhanced Business Report:")
 	fmt.Println("========================")
 
 	report := processor.GenerateBusinessReport()
 	metrics := report["metrics"].(*PaymentMetrics)
 	circuitStates := report["circuit_breaker_states"].(map[string]string)
+	gatewayStats := report["gateway_stats"].(map[string]interface{})
 
 	fmt.Printf("Total Processed: %d\n", metrics.TotalProcessed)
 	fmt.Printf("Successful: %d\n", metrics.Successful)
@@ -715,19 +755,24 @@ func main() {
 	fmt.Printf("Total Amount Processed: $%.2f\n", metrics.TotalAmount)
 	fmt.Printf("Average Processing Time: %v\n", metrics.AverageProcessingTime)
 
+	fmt.Println("\nGateway Statistics:")
+	for gateway, stats := range gatewayStats {
+		statMap := stats.(map[string]interface{})
+		fmt.Printf("  %s: %.1f%% success (%d/%d attempts)\n", 
+			gateway, statMap["success_rate"], statMap["successes"], statMap["attempts"])
+	}
+
 	fmt.Println("\nCircuit Breaker States:")
 	for gateway, state := range circuitStates {
 		fmt.Printf("  %s: %s\n", gateway, state)
 	}
 
-	// Save detailed report
 	if err := processor.SaveReportToFile("enhanced_payment_report.json"); err != nil {
 		fmt.Printf("Error saving report: %v\n", err)
 	} else {
 		fmt.Println("\nDetailed report saved to enhanced_payment_report.json")
 	}
 
-	// Demonstrate system resilience
 	fmt.Println("\nEnhanced Chaos Resilience Analysis:")
 	fmt.Println("==================================")
 	fmt.Printf("System handled %.1f%% success rate under chaos conditions\n", metrics.SuccessRate*100)
@@ -736,7 +781,6 @@ func main() {
 	fmt.Printf("Processed $%.2f in total transaction volume\n", metrics.TotalAmount)
 	fmt.Printf("Average processing time: %v\n", metrics.AverageProcessingTime)
 	
-	// Show configuration
 	fmt.Println("\nSystem Configuration:")
 	fmt.Printf("Max Retries: %d\n", config.MaxRetries)
 	fmt.Printf("Fraud Threshold: %.2f\n", config.FraudThreshold)
